@@ -5,13 +5,23 @@ import requests
 import mimetypes
 import functools
 import time
+import logging
 from datetime import datetime
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, render_template_string, session, redirect, url_for, jsonify, send_file
 from dotenv import load_dotenv
 
 # 加载环境变量
 load_dotenv()
+
+# ================= 日志配置 =================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -20,20 +30,29 @@ app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24))
 APP_TOKEN = os.getenv('APP_TOKEN', 'admin123')
 STORAGE_MODE = os.getenv('STORAGE_MODE', 'cloud').lower()
 
+# 并发控制：默认 5 个线程
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', 5))
+
 # 图床配置
 UPLOAD_API_URL = os.getenv('UPLOAD_API_URL', "https://your.domain/upload")
 AUTH_CODE = os.getenv('AUTH_CODE', "your_authCode")
 
 # 本地配置
-SITE_DOMAIN = os.getenv('SITE_DOMAIN', 'http://127.0.0.1:5000').rstrip('/')
+SITE_DOMAIN = os.getenv('SITE_DOMAIN', 'http://127.0.0.1:7860').rstrip('/')
 LOCAL_IMAGE_FOLDER = 'static/uploads'
-TEMP_MD_FOLDER = 'static/temp_md' # 处理后的MD文件存放处
+TEMP_MD_FOLDER = 'static/temp_md'
 
 # 确保目录存在
 os.makedirs(LOCAL_IMAGE_FOLDER, exist_ok=True)
 os.makedirs(TEMP_MD_FOLDER, exist_ok=True)
 
 HEADERS = {'User-Agent': 'Apifox/1.0.0 (https://apifox.com)'}
+
+logger.info("="*30)
+logger.info(f"Starting MD Migrator...")
+logger.info(f"Mode: {STORAGE_MODE.upper()}")
+logger.info(f"Max Workers: {MAX_WORKERS}")
+logger.info("="*30)
 
 # ================= 文件系统管理逻辑 =================
 
@@ -54,13 +73,10 @@ def get_file_list_from_disk():
             mtime = 0
             time_str = "Unknown"
 
-        display_name = filename
-        
-        # 添加时间戳参数防止浏览器缓存
         url = f"{SITE_DOMAIN}/api/download/{filename}?t={int(mtime)}"
 
         files_data.append({
-            'filename': display_name,      
+            'filename': filename,      
             'real_filename': filename,     
             'timestamp': time_str,
             'timestamp_sort': mtime,
@@ -77,13 +93,18 @@ def auth_required(f):
     def decorated_function(*args, **kwargs):
         auth_header = request.headers.get('Authorization')
         token_query = request.args.get('token')
+        client_ip = request.remote_addr
         api_token = None
+        
         if auth_header and auth_header.startswith("Bearer "):
             api_token = auth_header.split(" ")[1]
-        elif token_query: api_token = token_query
+        elif token_query: 
+            api_token = token_query
             
         if api_token == APP_TOKEN: return f(*args, **kwargs)
         if session.get('is_logged_in'): return f(*args, **kwargs)
+        
+        logger.warning(f"Unauthorized access from {client_ip}")
         if request.path.startswith('/api/'): return jsonify({"error": "Unauthorized"}), 401
         return redirect(url_for('login'))
     return decorated_function
@@ -99,11 +120,16 @@ def get_extension(url, content_type=None):
 
 def download_image(url):
     try:
+        start_time = time.time()
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
         if resp.status_code == 200:
+            logger.info(f"Downloaded: {url} ({len(resp.content)}b, {time.time()-start_time:.2f}s)")
             return resp.content, resp.headers.get('Content-Type')
+        logger.warning(f"Download {resp.status_code}: {url}")
         return None, None
-    except: return None, None
+    except Exception as e:
+        logger.error(f"Download failed {url}: {e}")
+        return None, None
 
 def upload_to_cloud(image_data, filename, folder_name):
     try:
@@ -118,7 +144,7 @@ def upload_to_cloud(image_data, filename, folder_name):
             return res['data']
         return None
     except Exception as e:
-        print(f"Cloud Upload Error: {e}")
+        logger.error(f"Cloud Upload Error: {e}")
         return None
 
 def save_to_local(image_data, original_url, content_type, folder_name):
@@ -131,36 +157,100 @@ def save_to_local(image_data, original_url, content_type, folder_name):
         path = os.path.join(save_dir, unique_name)
         with open(path, 'wb') as f: f.write(image_data)
         return f"{SITE_DOMAIN}/{LOCAL_IMAGE_FOLDER}/{safe_folder}/{unique_name}"
-    except: return None
+    except Exception as e:
+        logger.error(f"Local Save Error: {e}")
+        return None
+
+# --- 单个图片处理任务 (用于线程池) ---
+def process_single_image_task(url, filename_no_ext):
+    """
+    下载并上传单个图片
+    返回: (原始URL, 新URL) 或 (原始URL, None)
+    """
+    # 1. 下载
+    img_data, c_type = download_image(url)
+    if not img_data:
+        return url, None
+
+    # 2. 上传/保存
+    fname = url.split('/')[-1].split('?')[0] or "image.jpg"
+    new_url = None
+    
+    if STORAGE_MODE == 'cloud':
+        new_url = upload_to_cloud(img_data, fname, filename_no_ext)
+    else:
+        new_url = save_to_local(img_data, url, c_type, filename_no_ext)
+    
+    return url, new_url
 
 def process_markdown_content(content, filename_no_ext):
+    """
+    并发处理 Markdown 内容
+    """
     pattern = re.compile(r'!\[(.*?)\]\((.*?)\)')
+    
+    # 1. 扫描所有图片链接
+    matches = pattern.findall(content) # 返回 [(alt, url), (alt, url)...]
+    
+    # 2. 筛选出需要处理的 URL (去重，且必须是 http 开头，且不是本站域名)
+    unique_urls = set()
+    for _, url in matches:
+        if url.startswith(('http://', 'https://')):
+            # 如果是本地模式，排除掉已经是本站的链接
+            if STORAGE_MODE == 'local' and SITE_DOMAIN in url:
+                continue
+            unique_urls.add(url)
+    
+    logger.info(f"Found {len(matches)} images, {len(unique_urls)} need processing.")
+    
+    # 3. 线程池并发处理
+    url_map = {} # 旧URL -> 新URL
+    success_count = 0
+    failed_count = 0
+    
+    if unique_urls:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # 提交任务
+            future_to_url = {
+                executor.submit(process_single_image_task, url, filename_no_ext): url 
+                for url in unique_urls
+            }
+            
+            # 获取结果
+            for future in as_completed(future_to_url):
+                old_url, new_url = future.result()
+                if new_url:
+                    url_map[old_url] = new_url
+                    success_count += 1
+                else:
+                    failed_count += 1
+
+    # 4. 执行替换 (使用 re.sub 和 映射表)
     def replace_callback(match):
-        alt, url = match.group(1), match.group(2)
-        if not url.startswith(('http://', 'https://')): return match.group(0)
-        if STORAGE_MODE == 'local' and SITE_DOMAIN in url: return match.group(0)
+        alt_text = match.group(1)
+        original_url = match.group(2)
+        
+        # 如果在映射表中，说明处理成功，替换之
+        if original_url in url_map:
+            return f'![{alt_text}]({url_map[original_url]})'
+        
+        # 否则保持原样
+        return match.group(0)
 
-        img_data, c_type = download_image(url)
-        if not img_data: return match.group(0)
-
-        fname = url.split('/')[-1].split('?')[0] or "image.jpg"
-        new_url = None
-        if STORAGE_MODE == 'cloud':
-            new_url = upload_to_cloud(img_data, fname, filename_no_ext)
-        else:
-            new_url = save_to_local(img_data, url, c_type, filename_no_ext)
-        return f'![{alt}]({new_url})' if new_url else match.group(0)
-    return pattern.sub(replace_callback, content)
+    new_content = pattern.sub(replace_callback, content)
+    
+    logger.info(f"Task finished. Total: {len(unique_urls)}, Success: {success_count}, Failed: {failed_count}")
+    return new_content
 
 def save_processed_md(content, original_filename):
     safe_filename = os.path.basename(original_filename)
     save_path = os.path.join(TEMP_MD_FOLDER, safe_filename)
     with open(save_path, 'w', encoding='utf-8') as f:
         f.write(content)
+    logger.info(f"Markdown file saved: {save_path}")
     return f"{SITE_DOMAIN}/api/download/{safe_filename}"
 
-# ================= HTML 模板 =================
-
+# ================= HTML 模板 (保持不变) =================
 BASE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -173,7 +263,6 @@ BASE_TEMPLATE = """
         .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.1); box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1); }
         .btn-disabled { background-color: #475569 !important; color: #94a3b8 !important; cursor: not-allowed !important; }
         .search-input:focus { outline: none; border-color: #60a5fa; box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.3); }
-        /* 自定义滚动条样式 */
         .scroll-custom::-webkit-scrollbar { width: 6px; }
         .scroll-custom::-webkit-scrollbar-track { background: transparent; }
         .scroll-custom::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
@@ -198,13 +287,11 @@ LOGIN_CONTENT = """
 
 INDEX_CONTENT = """
 <div class="w-full max-w-4xl space-y-6">
-    <!-- Header -->
     <div class="flex justify-between items-center mb-4">
         <h1 class="text-2xl font-bold text-white">MD 图片迁移 <span class="text-xs text-blue-400 border border-blue-400/30 px-2 py-0.5 rounded ml-2">{{ mode|upper }}</span></h1>
         <a href="/logout" class="text-xs bg-white/5 hover:bg-white/10 px-4 py-2 rounded-lg transition border border-white/10">退出</a>
     </div>
 
-    <!-- Upload Area -->
     <div class="glass rounded-2xl p-8">
         <form method="post" enctype="multipart/form-data" id="uploadForm">
             <div class="border-2 border-dashed border-gray-600 rounded-xl p-10 text-center hover:bg-white/5 transition cursor-pointer relative group" id="dropZone">
@@ -219,7 +306,6 @@ INDEX_CONTENT = """
         </form>
     </div>
 
-    <!-- History Area -->
     <div class="glass rounded-2xl p-6">
         <div class="flex flex-col md:flex-row justify-between items-center mb-6 gap-4">
             <h2 class="text-xl font-bold flex items-center gap-2">
@@ -235,19 +321,8 @@ INDEX_CONTENT = """
         </div>
 
         {% if history %}
-        <!-- 
-            核心修改：
-            max-h-[320px]: 限制最大高度 (约 5-6 行)
-            overflow-y-auto: 超出高度显示滚动条
-            scroll-custom: 自定义滚动条样式
-        -->
         <div class="overflow-x-auto overflow-y-auto max-h-[320px] rounded-lg border border-gray-700 scroll-custom relative">
             <table class="w-full text-left text-sm text-gray-300" id="historyTable">
-                <!-- 
-                   sticky top-0: 表头固定
-                   bg-slate-900: 给表头加背景色，防止滚动时内容重叠
-                   z-10: 确保表头在内容之上
-                -->
                 <thead class="sticky top-0 z-10 bg-slate-900 text-xs uppercase text-gray-400 shadow-md">
                     <tr><th class="px-4 py-3">文件名</th><th class="px-4 py-3">处理时间</th><th class="px-4 py-3 text-right">操作</th></tr>
                 </thead>
@@ -336,14 +411,19 @@ SUCCESS_CONTENT = """
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
+        client_ip = request.remote_addr
         if request.form.get('token') == APP_TOKEN:
             session['is_logged_in'] = True
+            logger.info(f"Web Login Success | IP: {client_ip}")
             return redirect(url_for('index'))
-        else: return render_template_string(BASE_TEMPLATE, content_html=render_template_string(LOGIN_CONTENT, error="无效的 Token"))
+        else: 
+            logger.warning(f"Web Login Failed | IP: {client_ip}")
+            return render_template_string(BASE_TEMPLATE, content_html=render_template_string(LOGIN_CONTENT, error="无效的 Token"))
     return render_template_string(BASE_TEMPLATE, content_html=render_template_string(LOGIN_CONTENT, error=None))
 
 @app.route('/logout')
 def logout():
+    logger.info(f"Web Logout | IP: {request.remote_addr}")
     session.pop('is_logged_in', None)
     return redirect(url_for('login'))
 
@@ -355,12 +435,15 @@ def index():
         file = request.files['file']
         if not file.filename: return "未选择文件", 400
         try:
+            logger.info(f"Received file upload (Web): {file.filename}")
             md_name = os.path.splitext(file.filename)[0]
             content = file.read().decode('utf-8', errors='ignore')
             new_content = process_markdown_content(content, md_name)
             download_url = save_processed_md(new_content, file.filename)
             return render_template_string(BASE_TEMPLATE, content_html=render_template_string(SUCCESS_CONTENT, download_url=download_url))
-        except Exception as e: return f"Error: {e}", 500
+        except Exception as e: 
+            logger.error(f"Web Process Error: {e}", exc_info=True)
+            return f"Error: {e}", 500
 
     history = get_file_list_from_disk()
     inner_html = render_template_string(INDEX_CONTENT, mode=STORAGE_MODE, history=history)
@@ -373,12 +456,15 @@ def api_process():
     file = request.files['file']
     if not file.filename: return jsonify({"code": 400, "error": "Empty filename"}), 400
     try:
+        logger.info(f"Received file upload (API): {file.filename}")
         md_name = os.path.splitext(file.filename)[0]
         content = file.read().decode('utf-8', errors='ignore')
         new_content = process_markdown_content(content, md_name)
         download_url = save_processed_md(new_content, file.filename)
         return jsonify({"code": 200, "message": "success", "filename": file.filename, "url": download_url})
-    except Exception as e: return jsonify({"code": 500, "error": str(e)}), 500
+    except Exception as e: 
+        logger.error(f"API Process Error: {e}", exc_info=True)
+        return jsonify({"code": 500, "error": str(e)}), 500
 
 @app.route('/api/history', methods=['GET'])
 @auth_required
@@ -386,20 +472,25 @@ def api_history():
     try:
         files = get_file_list_from_disk()
         return jsonify({"code": 200, "message": "success", "data": files})
-    except Exception as e: return jsonify({"code": 500, "error": str(e)}), 500
+    except Exception as e: 
+        logger.error(f"API History Error: {e}")
+        return jsonify({"code": 500, "error": str(e)}), 500
 
 @app.route('/api/download/<filename>', methods=['GET'])
 @auth_required
 def api_download(filename):
     safe_filename = os.path.basename(filename)
     file_path = os.path.join(TEMP_MD_FOLDER, safe_filename)
-    if not os.path.exists(file_path): return jsonify({"code": 404, "error": "File not found"}), 404
+    if not os.path.exists(file_path): 
+        logger.warning(f"Download not found: {safe_filename}")
+        return jsonify({"code": 404, "error": "File not found"}), 404
     try:
+        logger.info(f"File downloaded: {safe_filename}")
         return send_file(file_path, as_attachment=True, download_name=safe_filename, mimetype='text/markdown')
-    except Exception as e: return jsonify({"code": 500, "error": str(e)}), 500
+    except Exception as e: 
+        logger.error(f"Download Error: {e}")
+        return jsonify({"code": 500, "error": str(e)}), 500
 
 if __name__ == '__main__':
-    # 获取环境变量 PORT，默认为 7860
     port = int(os.environ.get('PORT', 7860))
-    # host='0.0.0.0' 允许外部访问
     app.run(debug=True, host='0.0.0.0', port=port)
