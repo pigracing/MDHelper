@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  md-migrator:
+    build: .
+    container_name: md-migrator
+    restart: always
+    ports:
+      # 宿主机端口:容器端口
+      - "7860:7860"
+    environment:
+      # === 端口配置 ===
+      - PORT=7860
+      
+      # === 基础配置 ===
+      - FLASK_SECRET_KEY=change_this_random_string
+      - APP_TOKEN=admin123
+      
+      # === 模式配置 (cloud 或 local) ===
+      - STORAGE_MODE=cloud
+      
+      # === Cloud 模式配置 ===
+      - UPLOAD_API_URL=https://your.domain/upload
+      - AUTH_CODE=your_auth_code
+      
+      # === Local 模式配置 ===
+      # 注意：如果端口变了，这里的域名也要相应修改
+      - SITE_DOMAIN=http://127.0.0.1:7860
+      
+    volumes:
+      - ./data/temp_md:/app/static/temp_md
+      - ./data/uploads:/app/static/uploads
