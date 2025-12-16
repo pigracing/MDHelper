@@ -30,7 +30,7 @@ app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24))
 APP_TOKEN = os.getenv('APP_TOKEN', 'admin123')
 STORAGE_MODE = os.getenv('STORAGE_MODE', 'cloud').lower()
 
-# 并发控制：默认 5 个线程
+# 并发控制
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', 5))
 
 # 图床配置
@@ -73,7 +73,10 @@ def get_file_list_from_disk():
             mtime = 0
             time_str = "Unknown"
 
-        url = f"{SITE_DOMAIN}/api/download/{filename}?t={int(mtime)}"
+        # URL 编码处理：文件名中可能有空格，下载链接也需要处理
+        # 但这里的 filename 是路径参数，通常由浏览器自动编码，这里手动替换空格更保险
+        encoded_filename = filename.replace(' ', '%20')
+        url = f"{SITE_DOMAIN}/api/download/{encoded_filename}?t={int(mtime)}"
 
         files_data.append({
             'filename': filename,      
@@ -156,6 +159,7 @@ def save_to_local(image_data, original_url, content_type, folder_name):
         unique_name = f"{uuid.uuid4().hex}{ext}"
         path = os.path.join(save_dir, unique_name)
         with open(path, 'wb') as f: f.write(image_data)
+        # 注意：这里返回的 URL 可能包含中文或空格
         return f"{SITE_DOMAIN}/{LOCAL_IMAGE_FOLDER}/{safe_folder}/{unique_name}"
     except Exception as e:
         logger.error(f"Local Save Error: {e}")
@@ -165,14 +169,11 @@ def save_to_local(image_data, original_url, content_type, folder_name):
 def process_single_image_task(url, filename_no_ext):
     """
     下载并上传单个图片
-    返回: (原始URL, 新URL) 或 (原始URL, None)
     """
-    # 1. 下载
     img_data, c_type = download_image(url)
     if not img_data:
         return url, None
 
-    # 2. 上传/保存
     fname = url.split('/')[-1].split('?')[0] or "image.jpg"
     new_url = None
     
@@ -189,52 +190,49 @@ def process_markdown_content(content, filename_no_ext):
     """
     pattern = re.compile(r'!\[(.*?)\]\((.*?)\)')
     
-    # 1. 扫描所有图片链接
-    matches = pattern.findall(content) # 返回 [(alt, url), (alt, url)...]
+    matches = pattern.findall(content)
     
-    # 2. 筛选出需要处理的 URL (去重，且必须是 http 开头，且不是本站域名)
     unique_urls = set()
     for _, url in matches:
         if url.startswith(('http://', 'https://')):
-            # 如果是本地模式，排除掉已经是本站的链接
             if STORAGE_MODE == 'local' and SITE_DOMAIN in url:
                 continue
             unique_urls.add(url)
     
     logger.info(f"Found {len(matches)} images, {len(unique_urls)} need processing.")
     
-    # 3. 线程池并发处理
-    url_map = {} # 旧URL -> 新URL
+    url_map = {} 
     success_count = 0
     failed_count = 0
     
     if unique_urls:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # 提交任务
             future_to_url = {
                 executor.submit(process_single_image_task, url, filename_no_ext): url 
                 for url in unique_urls
             }
             
-            # 获取结果
             for future in as_completed(future_to_url):
                 old_url, new_url = future.result()
                 if new_url:
-                    url_map[old_url] = new_url
+                    # ====================================================
+                    # 【核心修改】在这里对 URL 进行编码处理
+                    # 将空格替换为 %20，保证 Markdown 解析正常
+                    # ====================================================
+                    encoded_new_url = new_url.replace(' ', '%20')
+                    
+                    url_map[old_url] = encoded_new_url
                     success_count += 1
                 else:
                     failed_count += 1
 
-    # 4. 执行替换 (使用 re.sub 和 映射表)
     def replace_callback(match):
         alt_text = match.group(1)
         original_url = match.group(2)
         
-        # 如果在映射表中，说明处理成功，替换之
         if original_url in url_map:
             return f'![{alt_text}]({url_map[original_url]})'
         
-        # 否则保持原样
         return match.group(0)
 
     new_content = pattern.sub(replace_callback, content)
@@ -248,7 +246,10 @@ def save_processed_md(content, original_filename):
     with open(save_path, 'w', encoding='utf-8') as f:
         f.write(content)
     logger.info(f"Markdown file saved: {save_path}")
-    return f"{SITE_DOMAIN}/api/download/{safe_filename}"
+    
+    # 返回下载链接时，文件名也进行编码，防止下载链接断裂
+    encoded_filename = safe_filename.replace(' ', '%20')
+    return f"{SITE_DOMAIN}/api/download/{encoded_filename}"
 
 # ================= HTML 模板 (保持不变) =================
 BASE_TEMPLATE = """
